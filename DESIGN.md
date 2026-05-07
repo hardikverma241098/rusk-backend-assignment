@@ -60,7 +60,7 @@ With this architecture:
 
 ### Kafka partitioning at 1M users
 ```
-watch.heartbeat topic: 100 partitions
+watch.heartbeat topic: start with 50 partitions (justified in Section 8), replication factor 3, retention 48h
   → 333 msg/s per partition (trivial per partition)
   → 100 consumer instances in watch-progress-writer group
   → linear horizontal scaling — add partitions and consumers together
@@ -193,7 +193,7 @@ window.addEventListener('beforeunload', () => {
 
 ### Out-of-order Kafka messages
 
-Partitioning by `userId` ensures all heartbeats for a user land on the same Kafka partition — ordered by default. Out-of-order delivery is not expected in steady state.
+Partitioning by `userId` ensures all heartbeats for a user land on the same Kafka partition, strongly reducing ordering anomalies. However consumers must still be idempotent — retries, rebalances, and multi-producer races can cause reordering even within a partition. Our `SETMAX` in Redis and `$max` in MongoDB handle this: a lower value arriving late never overwrites a higher one.
 
 As an additional safety net, the DB upsert uses MongoDB's `$max` operator which only updates the field if the new value is greater:
 
@@ -306,6 +306,196 @@ Handlers are thin — parse, validate, delegate, respond. Services own business 
 
 **No rate limiting.** A client sending heartbeats every second instead of every 30 generates 30x expected Kafka volume per user. A per-userId token bucket rate limiter belongs at the API gateway layer.
 
-**Kafka topic configuration.** Production topics need explicit partition counts and replication factors defined before deployment. For `watch.heartbeat` at 1M users: 100 partitions, replication factor 3, retention 24h (heartbeats are transient). Partition count is the ceiling on consumer parallelism and should be provisioned ahead of expected peak — Kafka partitions cannot be reduced after creation.
+**Kafka topic configuration.** Production topics need explicit partition counts and replication factors defined before deployment. For `watch.heartbeat` at 1M users: start with 50 partitions (see Section 8 for full justification), replication factor 3, retention 48h. Partition count is the ceiling on consumer parallelism — monitor consumer lag before adding more. Partitions cannot be reduced after creation so provision conservatively.
 
 **Authentication and authorization.** Assumed to be handled at the API gateway. In production, every endpoint needs JWT validation and the watch endpoint should verify the requesting user matches the `userId` in the payload.
+
+---
+
+## 8. Scale Concerns and Production Hardening
+
+### Kafka partition count — proper justification
+
+The codebase references "50 partitions" as a starting point. Here is the reasoning:
+
+```
+Target throughput at 1M users: ~33,333 msg/s
+Average heartbeat payload: ~200 bytes
+Single partition throughput ceiling: ~10MB/s = ~50,000 msg/s
+
+Throughput alone does not drive partition count here —
+33,333 msg/s across even 10 partitions is well within Kafka limits.
+
+What actually drives partition count:
+  Consumer parallelism: max concurrent consumer instances = partition count
+  At 33,333 msg/s with 50 consumers = 666 msg/s per consumer → trivial CPU load
+  Rebalance cost: more partitions = longer rebalance time on pod restart/scale
+  Broker overhead: each partition has replication cost across 3 brokers
+
+Starting point: 50 partitions
+  → Monitor consumer lag in production
+  → If lag grows consistently, add consumer instances first (not partitions)
+  → Add partitions only if consumers are maxed out CPU-wise
+  → Partitions cannot be reduced after creation — provision conservatively
+```
+
+Never pick a partition count without profiling actual consumer throughput and CPU in staging.
+
+---
+
+### Ordering guarantees — full picture
+
+To expand on the above, sources of reordering even within a partition:
+
+- Producer retries with `acks=all` can produce duplicate messages if the broker acks after the producer timeout
+- Consumer rebalances can cause a partition to be reassigned mid-batch, replaying uncommitted offsets
+- Multiple producer instances racing on the same partition key
+- Network partitions causing retry storms
+
+**The correct stance:** partitioning reduces ordering issues significantly, but consumers must be designed to be idempotent regardless. Our `$max` operator in MongoDB and `SETMAX` in Redis both satisfy this — a lower value arriving late never overwrites a higher one. Ordering anomalies are handled by design, not assumed away.
+
+---
+
+### Backpressure — what happens when the system falls behind
+
+This was not addressed in the original design and is a real production concern.
+
+**Consumer lag:**
+```
+Symptom: Kafka consumer group lag grows continuously
+Cause: consumers processing slower than producers publish
+Impact: Redis writes delayed, watch progress staleness grows beyond 5s
+
+Mitigation:
+  1. Alert when consumer lag > 10,000 messages
+  2. Scale consumer pods horizontally — each new pod takes ownership
+     of a subset of partitions automatically via consumer group rebalance
+  3. If per-consumer CPU is maxed, increase partition count and scale again
+```
+
+**Redis saturation:**
+```
+At 1M users: 33,333 SET ops/s
+Single Redis instance capacity: ~100,000 ops/s → fine initially
+Approaching saturation:
+  → Redis Cluster: shard keyspace across multiple nodes
+  → Separate Redis instances for watch progress vs purchase idempotency
+     (different access patterns, different TTL needs)
+
+Memory pressure:
+  1M keys × ~500 bytes = ~500MB → manageable on a standard Redis instance
+  Set maxmemory-policy to allkeys-lru (NOT noeviction)
+  allkeys-lru evicts least recently active keys first —
+  users who haven't watched in days get evicted before active sessions
+```
+
+**Flush job taking longer than its interval:**
+```
+Symptom: flush job takes 8 mins, next CronJob starts at 5 min mark
+Risk: two jobs scanning same Redis keyspace simultaneously
+     → duplicate getdel → missing records → silent data loss
+
+Mitigations:
+  1. Kubernetes CronJob with concurrencyPolicy: Forbid
+     (new job skipped if previous still running)
+  2. Redis distributed lock: SETNX lock:flush-job before starting,
+     release on completion
+  3. Long term: move to Redis Stream consumer group —
+     natural single-consumer-per-partition guarantee, no locking needed
+```
+
+**Kafka backlog explosion:**
+```
+Symptom: consumers completely down for extended period
+Risk: messages older than retention policy (24h) expire permanently
+
+Mitigations:
+  1. Increase watch.heartbeat retention to 48h as safety buffer
+  2. Alert when consumer lag > 30 min equivalent of messages
+  3. Dead-letter topic for messages that fail all retry attempts
+```
+
+---
+
+### Redis durability concerns
+
+Redis is treated as the hot write layer with the DB as durable storage. However Redis has its own failure modes that affect watch progress:
+
+**Redis restart (default config):**
+```
+Default Redis is in-memory only. Restart = all keys lost.
+If flush job has not run since last heartbeat: progress lost.
+
+Options:
+  a) Redis AOF persistence (appendonly yes):
+     Logs every write operation to disk
+     On restart: replays AOF log, full recovery
+     Cost: ~20% write performance overhead — acceptable for our write volume
+
+  b) RDB snapshots:
+     Periodic dump to disk (every 60s by default)
+     Recovery: restore from snapshot — up to 60s of data loss
+     Lower overhead than AOF
+
+  c) Accept the loss:
+     Flush job runs every 5 mins, so max loss = 5 mins of watch progress
+     Simplest operationally, acceptable for this use case
+```
+
+**Eviction policy:**
+```
+If Redis hits maxmemory with noeviction policy (default):
+  → New writes return errors
+  → Watch progress updates silently fail
+  → No visibility into the problem
+
+Correct configuration:
+  maxmemory-policy allkeys-lru
+  Evicts least recently used keys automatically
+  Active users' progress is preserved, stale users' keys evicted
+  Always set this explicitly — never rely on defaults in production
+```
+
+**Replication lag:**
+```
+Redis replica can lag behind primary by tens to hundreds of milliseconds.
+If primary crashes and replica is promoted, last few writes may be lost.
+For watch progress this is acceptable — losing <1s of progress is fine.
+For purchase idempotency this is more concerning — a duplicate purchase
+during the replication lag window could slip through.
+Mitigation for purchase: Redis WAIT command ensures replica acknowledged
+write before responding. Cost: added latency per purchase. Worth it.
+```
+
+---
+
+### Flush job architecture — current limitation and evolution path
+
+**Current:** `setInterval` inside the service process scanning Redis keyspace with SCAN.
+
+**Problem at scale:** Redis SCAN iterates the full keyspace — O(N) where N is total key count. At 1M active users = 1M keys, this becomes expensive and blocks the Redis event loop during the scan.
+
+**Evolution path:**
+
+Step 1 (immediate, before horizontal scaling): Move to Kubernetes CronJob with `concurrencyPolicy: Forbid`. Eliminates concurrent flush overlap.
+
+Step 2 (at ~100K users): Replace SCAN with a dirty-key queue.
+```
+Watch consumer:
+  → SETMAX watch:progress:{userId}:{contentId}   (same)
+  → LPUSH flush:dirty-queue {userId}:{contentId} (track changed keys)
+
+Flush job:
+  → LRANGE flush:dirty-queue 0 499  (pop 500 keys atomically)
+  → fetch those specific Redis keys
+  → bulk upsert to DB
+  → LTRIM flush:dirty-queue 500 -1
+```
+No keyspace scan. Only processes keys that actually changed. Controlled batch size prevents DB spikes.
+
+Step 3 (at ~1M users): Redis Streams with consumer groups.
+```
+Watch consumer → XADD watch:dirty-stream {userId, contentId}
+Flush consumer group → XREADGROUP batches of 500 → process → XACK
+```
+Natural backpressure, acknowledgment guarantees, multiple flush workers with no overlap.
